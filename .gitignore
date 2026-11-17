@@ -1,0 +1,21 @@
+# Compiled binaries
+hello_cuda
+market_generator
+hft_analytics
+*.o
+*.out
+
+# Build directories
+build/
+
+# Python
+__pycache__/
+*.pyc
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# System
+.DS_Store
