@@ -169,4 +169,148 @@ Input arrays include:
 
 The main CUDA analytics kernel distributes market events across GPU threads.
 
-The implementation also
+The implementation also uses shared memory for partial VWAP reduction.
+
+**Current configuration:**
+
+- CUDA threads per block: 256
+- Default workload: 1,048,576 events
+- Data processing: Parallel GPU execution
+- VWAP: Two-stage reduction
+
+## Compilation and Execution
+
+### Prerequisites
+
+- Ubuntu/Linux
+- NVIDIA GPU with CUDA support
+- NVIDIA driver
+- CUDA Toolkit
+- C++ compiler
+
+### Compile CUDA Analytics
+
+```bash
+nvcc -O2 -std=c++17 -arch=sm_50 \
+src/hft_analytics.cu -o hft_analytics
+```
+
+### Run with Default Workload
+
+```bash
+./hft_analytics
+```
+
+### Run with Custom Workload Sizes
+
+```bash
+./hft_analytics 100000
+./hft_analytics 500000
+./hft_analytics 1048576
+./hft_analytics 2097152
+./hft_analytics 5242880
+```
+
+The workload can be adjusted through the command-line argument.
+
+## Initial Benchmark Results
+
+The following results were collected on the NVIDIA GeForce 940MX.
+
+| Events | CPU Time (ms) | GPU Kernel (ms) | GPU End-to-End (ms) | Kernel Speedup |
+|---:|---:|---:|---:|---:|
+| 100,000 | 3.747 | 0.249 | 2.845 | 15.07× |
+| 500,000 | 8.122 | 0.991 | 9.550 | 8.20× |
+| 1,048,576 | 17.207 | 1.972 | 18.953 | 8.72× |
+| 2,097,152 | 34.069 | 3.833 | 35.707 | 8.89× |
+| 5,242,880 | 83.901 | 9.497 | 87.048 | 8.83× |
+
+*Note: These are initial single-run measurements, not statistically averaged results.*
+
+### Performance Observations
+
+1. GPU kernel execution achieved approximately 8.8× speedup at larger workloads.
+2. GPU execution time scaled effectively as the event count increased.
+3. End-to-end execution was slower than CPU execution for most tested workloads.
+4. CPU–GPU data transfers and associated overhead reduced the overall performance benefit.
+
+This demonstrates an important distinction between kernel-level acceleration and application-level performance.
+
+### Kernel Speedup vs End-to-End Speedup
+
+**Kernel-only speedup:**
+
+```text
+CPU Execution Time / GPU Kernel Execution Time
+```
+
+**End-to-end speedup:**
+
+```text
+CPU Execution Time / GPU End-to-End Execution Time
+```
+
+The two measurements are reported separately because GPU kernel execution excludes data-transfer overhead, whereas end-to-end execution includes it.
+
+## Verification
+
+The implementation compares CPU and GPU analytics results.
+
+Current test runs report:
+
+```text
+Verification: PASSED
+```
+
+This indicates that the implemented verification checks passed for the tested workloads.
+
+## Development Roadmap
+
+### Phase 1 — Core CUDA Analytics
+- [x] CUDA environment setup
+- [x] Synthetic market data generation
+- [x] CPU analytics implementation
+- [x] GPU analytics implementation
+- [x] Parallel VWAP reduction
+- [x] Variable workload support
+- [x] Initial CPU vs GPU benchmarking
+
+### Phase 2 — Benchmarking and Optimisation
+- [ ] Repeated benchmark measurements
+- [ ] Average, minimum and maximum execution time
+- [ ] Throughput measurement (million events/second)
+- [ ] CPU-to-GPU transfer time analysis
+- [ ] CUDA block-size experimentation
+- [ ] Memory access optimisation
+- [ ] Pinned host memory experiments
+
+### Phase 3 — Advanced Market Microstructure
+- [ ] Order Flow Imbalance (OFI)
+- [ ] Rolling VWAP
+- [ ] Trade imbalance
+- [ ] Price momentum
+- [ ] Spread dynamics
+
+### Phase 4 — Performance Visualisation
+- [ ] CPU vs GPU execution-time graphs
+- [ ] Throughput comparison
+- [ ] Kernel speedup visualisation
+- [ ] Memory-transfer overhead analysis
+- [ ] Benchmark result exports
+
+## Project Scope
+
+This is an educational and experimental CUDA market analytics project.
+
+It explores GPU parallelisation and performance characteristics using synthetic market data. It is not an exchange-grade trading system, production execution engine or validated trading strategy.
+
+The objective is to develop practical experience in GPU programming, parallel algorithms, memory management and performance benchmarking.
+
+## Author
+
+**Prathamesh Kulkarni**
+
+Master of Electrical and Electronics Engineering  
+University of Melbourne
+
+Interested in GPU Computing, Computer Architecture, FPGA Design, Low-Latency Systems and Hardware Acceleration.
