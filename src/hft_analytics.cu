@@ -81,15 +81,8 @@ MarketData generateMarketData(int N)
 // 2. CPU reference implementation
 // --------------------------------------------------
 
-Results runCPU(const MarketData& data, int N)
+void runCPU(const MarketData& data, int N, Results& r)
 {
-    Results r;
-
-    r.spread.resize(N);
-    r.mid.resize(N);
-    r.obi.resize(N);
-    r.signal.resize(N);
-
     double totalNotional = 0.0;
     double totalVolume = 0.0;
 
@@ -124,9 +117,7 @@ Results runCPU(const MarketData& data, int N)
         totalVolume += data.tradeQty[i];
     }
 
-    r.vwap = totalNotional / totalVolume;
-
-    return r;
+    r.vwap = static_cast<float>(totalNotional / totalVolume);
 }
 
 // --------------------------------------------------
@@ -531,7 +522,139 @@ bool verifyResults(
 
     return true;
 }
+// --------------------------------------------------
+// GPU-resident execution
+// Upload input once, execute multiple passes,
+// download output once.
+// --------------------------------------------------
 
+Timing runGPUResidentBatch(
+    const MarketData& data,
+    Results& results,
+    DeviceBuffers& d,
+    int N,
+    int blocks,
+    int passes,
+    cudaEvent_t start,
+    cudaEvent_t stop)
+{
+    Timing timing;
+
+    auto e2eStart = std::chrono::steady_clock::now();
+
+    // --------------------------------
+    // 1. Upload input data once
+    // --------------------------------
+
+    auto h2dStart = std::chrono::steady_clock::now();
+
+    CUDA_CHECK(cudaMemcpy(d.bid, data.bid.data(),
+        N * sizeof(float), cudaMemcpyHostToDevice));
+
+    CUDA_CHECK(cudaMemcpy(d.ask, data.ask.data(),
+        N * sizeof(float), cudaMemcpyHostToDevice));
+
+    CUDA_CHECK(cudaMemcpy(d.bidQty, data.bidQty.data(),
+        N * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+    CUDA_CHECK(cudaMemcpy(d.askQty, data.askQty.data(),
+        N * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+    CUDA_CHECK(cudaMemcpy(d.price, data.tradePrice.data(),
+        N * sizeof(float), cudaMemcpyHostToDevice));
+
+    CUDA_CHECK(cudaMemcpy(d.volume, data.tradeQty.data(),
+        N * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+    auto h2dEnd = std::chrono::steady_clock::now();
+
+    timing.h2d =
+        std::chrono::duration<double, std::milli>(
+            h2dEnd - h2dStart).count();
+
+    // --------------------------------
+    // 2. Execute analytics repeatedly
+    // --------------------------------
+
+    CUDA_CHECK(cudaEventRecord(start));
+
+    for (int pass = 0; pass < passes; pass++)
+    {
+        marketAnalytics<<<blocks, THREADS>>>(
+            d.bid, d.ask,
+            d.bidQty, d.askQty,
+            d.spread, d.mid, d.obi, d.signal,
+            N
+        );
+
+        partialVWAP<<<blocks, THREADS>>>(
+            d.price, d.volume,
+            d.partialN, d.partialV,
+            N
+        );
+
+        finalVWAP<<<1, THREADS>>>(
+            d.partialN, d.partialV,
+            d.totalN, d.totalV,
+            blocks
+        );
+    }
+
+    CUDA_CHECK(cudaGetLastError());
+
+    CUDA_CHECK(cudaEventRecord(stop));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+
+    float kernelMs = 0.0f;
+
+    CUDA_CHECK(cudaEventElapsedTime(
+        &kernelMs, start, stop));
+
+    timing.kernel = kernelMs;
+
+    // --------------------------------
+    // 3. Download final results once
+    // --------------------------------
+
+    auto d2hStart = std::chrono::steady_clock::now();
+
+    CUDA_CHECK(cudaMemcpy(results.spread.data(), d.spread,
+        N * sizeof(float), cudaMemcpyDeviceToHost));
+
+    CUDA_CHECK(cudaMemcpy(results.mid.data(), d.mid,
+        N * sizeof(float), cudaMemcpyDeviceToHost));
+
+    CUDA_CHECK(cudaMemcpy(results.obi.data(), d.obi,
+        N * sizeof(float), cudaMemcpyDeviceToHost));
+
+    CUDA_CHECK(cudaMemcpy(results.signal.data(), d.signal,
+        N * sizeof(int), cudaMemcpyDeviceToHost));
+
+    float totalN = 0.0f;
+    float totalV = 0.0f;
+
+    CUDA_CHECK(cudaMemcpy(&totalN, d.totalN,
+        sizeof(float), cudaMemcpyDeviceToHost));
+
+    CUDA_CHECK(cudaMemcpy(&totalV, d.totalV,
+        sizeof(float), cudaMemcpyDeviceToHost));
+
+    results.vwap = totalN / totalV;
+
+    auto d2hEnd = std::chrono::steady_clock::now();
+
+    timing.d2h =
+        std::chrono::duration<double, std::milli>(
+            d2hEnd - d2hStart).count();
+
+    auto e2eEnd = std::chrono::steady_clock::now();
+
+    timing.e2e =
+        std::chrono::duration<double, std::milli>(
+            e2eEnd - e2eStart).count();
+
+    return timing;
+}
 // --------------------------------------------------
 // 6. Benchmark one workload
 // --------------------------------------------------
@@ -546,6 +669,11 @@ bool benchmarkWorkload(int N, std::ofstream& csv)
 
     Results cpuResults;
     Results gpuResults;
+    // Preallocate CPU output buffers outside timed regions.
+    cpuResults.spread.resize(N);
+    cpuResults.mid.resize(N);
+    cpuResults.obi.resize(N);
+    cpuResults.signal.resize(N);
 
     // -------------------------------
     // GPU setup and allocation
@@ -584,7 +712,7 @@ bool benchmarkWorkload(int N, std::ofstream& csv)
 
     for (int i = 0; i < WARMUP_ITERATIONS; i++)
     {
-        Results warmupCPU = runCPU(data, N);
+        runCPU(data, N, cpuResults);
 
         runGPUIteration(
             data, gpuResults, d, N, blocks, start, stop
@@ -604,7 +732,7 @@ bool benchmarkWorkload(int N, std::ofstream& csv)
     {
         auto cpuStart = std::chrono::steady_clock::now();
 
-        cpuResults = runCPU(data, N);
+        runCPU(data, N, cpuResults);
 
         auto cpuEnd = std::chrono::steady_clock::now();
 
@@ -781,13 +909,318 @@ bool benchmarkWorkload(int N, std::ofstream& csv)
 
     return correct;
 }
+// --------------------------------------------------
+// GPU-resident comparative benchmark
+// --------------------------------------------------
 
+bool benchmarkResident(int N)
+{
+    constexpr int PASSES = 20;
+
+    std::cout << "\n========================================\n";
+    std::cout << "GPU-Resident Benchmark\n";
+    std::cout << "Events: " << N << "\n";
+    std::cout << "Analytics passes per batch: " << PASSES << "\n";
+    std::cout << "========================================\n";
+
+    MarketData data = generateMarketData(N);
+
+    Results cpuResults;
+    Results gpuResults;
+
+    cpuResults.spread.resize(N);
+    cpuResults.mid.resize(N);
+    cpuResults.obi.resize(N);
+    cpuResults.signal.resize(N);
+
+    gpuResults.spread.resize(N);
+    gpuResults.mid.resize(N);
+    gpuResults.obi.resize(N);
+    gpuResults.signal.resize(N);
+
+    int blocks = (N + THREADS - 1) / THREADS;
+
+    DeviceBuffers d;
+
+    auto setupStart = std::chrono::steady_clock::now();
+
+    allocateDeviceMemory(d, N, blocks);
+
+    cudaEvent_t start, stop;
+
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+
+    auto setupEnd = std::chrono::steady_clock::now();
+
+    double setupMs =
+        std::chrono::duration<double, std::milli>(
+            setupEnd - setupStart).count();
+
+    std::vector<double> cpuTimes;
+    std::vector<double> conventionalTimes;
+    std::vector<double> residentTimes;
+
+    std::vector<double> residentH2D;
+    std::vector<double> residentKernel;
+    std::vector<double> residentD2H;
+
+    std::ofstream rawCsv(
+        "benchmarks/gpu_resident_raw.csv"
+    );
+
+    if (!rawCsv.is_open())
+    {
+        std::cerr << "Cannot open resident raw CSV\n";
+        return false;
+    }
+
+    rawCsv << std::fixed << std::setprecision(6);
+
+    rawCsv
+        << "iteration,cpu_batch_ms,"
+        << "conventional_gpu_batch_ms,"
+        << "resident_h2d_ms,"
+        << "resident_kernel_ms,"
+        << "resident_d2h_ms,"
+        << "resident_e2e_ms\n";
+
+    // --------------------------------
+    // Warm-up
+    // --------------------------------
+
+    std::cout << "\nRunning warm-up iterations...\n";
+
+    for (int i = 0; i < WARMUP_ITERATIONS; i++)
+    {
+        for (int p = 0; p < PASSES; p++)
+            runCPU(data, N, cpuResults);
+
+        for (int p = 0; p < PASSES; p++)
+        {
+            runGPUIteration(
+                data, gpuResults, d,
+                N, blocks, start, stop
+            );
+        }
+
+        runGPUResidentBatch(
+            data, gpuResults, d,
+            N, blocks, PASSES, start, stop
+        );
+    }
+
+    // --------------------------------
+    // Measured iterations
+    // --------------------------------
+
+    std::cout << "Running measured batches...\n";
+
+    for (int i = 0; i < BENCHMARK_ITERATIONS; i++)
+    {
+        // CPU: 20 passes
+
+        auto cpuStart = std::chrono::steady_clock::now();
+
+        for (int p = 0; p < PASSES; p++)
+            runCPU(data, N, cpuResults);
+
+        auto cpuEnd = std::chrono::steady_clock::now();
+
+        double cpuMs =
+            std::chrono::duration<double, std::milli>(
+                cpuEnd - cpuStart).count();
+
+        cpuTimes.push_back(cpuMs);
+
+        // Conventional GPU: 20 complete transfers and passes
+
+        auto conventionalStart =
+            std::chrono::steady_clock::now();
+
+        for (int p = 0; p < PASSES; p++)
+        {
+            runGPUIteration(
+                data, gpuResults, d,
+                N, blocks, start, stop
+            );
+        }
+
+        auto conventionalEnd =
+            std::chrono::steady_clock::now();
+
+        double conventionalMs =
+            std::chrono::duration<double, std::milli>(
+                conventionalEnd - conventionalStart).count();
+
+        conventionalTimes.push_back(conventionalMs);
+
+        // GPU-resident: one upload, 20 passes, one download
+
+        Timing resident = runGPUResidentBatch(
+            data, gpuResults, d,
+            N, blocks, PASSES, start, stop
+        );
+
+        residentTimes.push_back(resident.e2e);
+        residentH2D.push_back(resident.h2d);
+        residentKernel.push_back(resident.kernel);
+        residentD2H.push_back(resident.d2h);
+
+        rawCsv
+            << i + 1 << ","
+            << cpuMs << ","
+            << conventionalMs << ","
+            << resident.h2d << ","
+            << resident.kernel << ","
+            << resident.d2h << ","
+            << resident.e2e << "\n";
+    }
+
+    rawCsv.close();
+
+    // --------------------------------
+    // Statistics
+    // --------------------------------
+
+    Statistics cpu = calculateStatistics(cpuTimes);
+    Statistics conventional = calculateStatistics(conventionalTimes);
+    Statistics resident = calculateStatistics(residentTimes);
+
+    Statistics h2d = calculateStatistics(residentH2D);
+    Statistics kernel = calculateStatistics(residentKernel);
+    Statistics d2h = calculateStatistics(residentD2H);
+
+    bool correct = verifyResults(
+        cpuResults, gpuResults, N
+    );
+
+    double residentSpeedup = cpu.mean / resident.mean;
+    double conventionalSpeedup = cpu.mean / conventional.mean;
+
+    // --------------------------------
+    // Results
+    // --------------------------------
+
+    std::cout << std::fixed << std::setprecision(4);
+
+    std::cout << "\n--- Batch latency (ms) ---\n";
+
+    std::cout << "CPU mean:                  "
+              << cpu.mean << "\n";
+
+    std::cout << "Conventional GPU mean:     "
+              << conventional.mean << "\n";
+
+    std::cout << "GPU-resident mean:         "
+              << resident.mean << "\n";
+
+    std::cout << "\n--- GPU-resident breakdown (ms) ---\n";
+
+    std::cout << "H2D:                       "
+              << h2d.mean << "\n";
+
+    std::cout << "Kernel (20 passes):        "
+              << kernel.mean << "\n";
+
+    std::cout << "D2H:                       "
+              << d2h.mean << "\n";
+
+    std::cout << "\n--- Performance ---\n";
+
+    std::cout << "CPU vs conventional GPU:   "
+              << conventionalSpeedup << "x\n";
+
+    std::cout << "CPU vs GPU-resident:       "
+              << residentSpeedup << "x\n";
+
+    std::cout << "GPU setup time:            "
+              << setupMs << " ms\n";
+
+    std::cout << "Verification: "
+              << (correct ? "PASSED" : "FAILED") << "\n";
+
+    // --------------------------------
+    // Summary CSV
+    // --------------------------------
+
+    std::ofstream summary(
+        "benchmarks/gpu_resident_summary.csv"
+    );
+
+    if (!summary.is_open())
+    {
+        std::cerr << "Cannot open summary CSV\n";
+
+        CUDA_CHECK(cudaEventDestroy(start));
+        CUDA_CHECK(cudaEventDestroy(stop));
+        freeDeviceMemory(d);
+
+        return false;
+    }
+
+    summary << std::fixed << std::setprecision(6);
+
+    summary
+        << "events,passes,cpu_mean_ms,"
+        << "conventional_gpu_mean_ms,"
+        << "resident_h2d_mean_ms,"
+        << "resident_kernel_mean_ms,"
+        << "resident_d2h_mean_ms,"
+        << "resident_e2e_mean_ms,"
+        << "cpu_vs_conventional_speedup,"
+        << "cpu_vs_resident_speedup,"
+        << "setup_ms,verification\n";
+
+    summary
+        << N << ","
+        << PASSES << ","
+        << cpu.mean << ","
+        << conventional.mean << ","
+        << h2d.mean << ","
+        << kernel.mean << ","
+        << d2h.mean << ","
+        << resident.mean << ","
+        << conventionalSpeedup << ","
+        << residentSpeedup << ","
+        << setupMs << ","
+        << (correct ? "PASSED" : "FAILED")
+        << "\n";
+
+    summary.close();
+
+    // --------------------------------
+    // Cleanup
+    // --------------------------------
+
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+
+    freeDeviceMemory(d);
+
+    return correct;
+}
 // --------------------------------------------------
 // 7. Main
 // --------------------------------------------------
 
 int main(int argc, char* argv[])
 {
+    // GPU-resident benchmark mode
+    if (argc == 3 && std::string(argv[1]) == "--resident")
+    {
+        int N = std::atoi(argv[2]);
+
+        if (N <= 0 || N > 10000000)
+        {
+            std::cerr << "Event count must be between 1 and "
+                      << "10,000,000.\n";
+            return 1;
+        }
+
+        return benchmarkResident(N) ? 0 : 1;
+    }
+
     std::vector<int> workloads = {
         100000,
         500000,

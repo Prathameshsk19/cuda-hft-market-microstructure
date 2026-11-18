@@ -1,0 +1,2 @@
+events,passes,cpu_mean_ms,conventional_gpu_mean_ms,resident_h2d_mean_ms,resident_kernel_mean_ms,resident_d2h_mean_ms,resident_e2e_mean_ms,cpu_vs_conventional_speedup,cpu_vs_resident_speedup,setup_ms,verification
+5000000,20,813.262358,1547.995861,42.900328,172.827985,25.811366,241.899336,0.525365,3.361987,50.799886,PASSED
