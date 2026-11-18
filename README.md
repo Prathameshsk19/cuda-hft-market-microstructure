@@ -252,6 +252,151 @@ CPU Execution Time / GPU End-to-End Execution Time
 
 The two measurements are reported separately because GPU kernel execution excludes data-transfer overhead, whereas end-to-end execution includes it.
 
+## GPU-Resident Market Analytics Benchmark
+
+### Objective
+
+Investigate how GPU-resident data processing affects end-to-end performance by reducing repeated CPU–GPU memory transfers.
+
+The experiment compares three execution strategies:
+
+1. **CPU:** Processes the dataset 20 times using preallocated output buffers.
+2. **Conventional GPU:** Transfers input data to the GPU, executes analytics and transfers results back on every pass.
+3. **GPU-resident:** Transfers input data once, executes 20 analytics passes on the GPU and transfers results back once.
+
+### Experimental Configuration
+
+| Parameter | Configuration |
+|---|---|
+| GPU | NVIDIA GeForce 940MX |
+| Architecture | Maxwell |
+| Compute capability | 5.0 |
+| CUDA architecture target | sm_50 |
+| CUDA Toolkit compiler | NVCC 12.0 |
+| CUDA threads per block | 256 |
+| Warm-up batches | 3 |
+| Measured batches | 20 |
+| Analytics passes per batch | 20 |
+| Workload sizes | 100K, 500K, 1M, 2M, 5M |
+
+GPU memory allocation and initialisation are measured separately as setup time and excluded from steady-state batch latency.
+
+### Benchmark Results
+
+The following results represent mean latency across 20 measured batches.
+
+| Events | CPU (ms) | Conventional GPU (ms) | GPU-resident (ms) | Resident Speedup |
+|---:|---:|---:|---:|---:|
+| 100,000 | 16.151 | 36.200 | 5.240 | 3.08× |
+| 500,000 | 85.448 | 176.181 | 25.597 | 3.34× |
+| 1,000,000 | 173.474 | 323.189 | 49.031 | 3.54× |
+| 2,000,000 | 348.509 | 609.888 | 96.721 | 3.60× |
+| 5,000,000 | 813.262 | 1547.996 | 241.899 | 3.36× |
+
+Resident speedup is calculated as:
+
+```text
+CPU Batch Latency / GPU-Resident Batch Latency
+```
+
+### GPU-Resident Timing Breakdown
+
+The GPU-resident implementation separately measures:
+
+- Host-to-device (H2D) transfer time.
+- CUDA kernel execution time.
+- Device-to-host (D2H) transfer time.
+- End-to-end batch latency.
+
+At 5 million events, the mean timing breakdown was:
+
+| Component | Time (ms) |
+|---|---:|
+| H2D | 42.900 |
+| Kernel execution (20 passes) | 172.828 |
+| D2H | 25.811 |
+| End-to-end | 241.899 |
+
+### Performance Observations
+
+1. GPU-resident execution achieved a 3.08×–3.60× speedup over CPU execution across the tested workloads.
+2. The highest observed speedup was 3.60× at 2 million events.
+3. GPU-resident execution was approximately 6.31×–6.91× faster than conventional GPU execution.
+4. Repeated host-device transfers significantly affected conventional GPU end-to-end performance.
+5. Kernel execution represented the largest component of GPU-resident batch latency.
+
+### Statistical Analysis
+
+Each workload contains 20 measured batches following three warm-up batches.
+
+The analysis script calculates:
+
+- Mean and median latency.
+- Standard deviation.
+- Minimum and maximum latency.
+- 95% confidence intervals using the Student's t distribution.
+- Processing throughput for complete execution paths.
+
+The raw measurements are preserved in `benchmarks/`, while consolidated statistical results are available in:
+
+`benchmarks/analysis/resident_statistics.csv`
+
+### Performance Visualisations
+
+The following figures are generated from the recorded benchmark measurements:
+
+**1. End-to-end latency comparison**
+
+![End-to-end latency](benchmarks/analysis/figures/01_latency_comparison.png)
+
+**2. GPU-resident speedup**
+
+![Speedup](benchmarks/analysis/figures/02_speedup.png)
+
+**3. GPU-resident latency breakdown**
+
+![Latency breakdown](benchmarks/analysis/figures/03_latency_breakdown.png)
+
+**4. Processing throughput**
+
+![Throughput](benchmarks/analysis/figures/04_throughput.png)
+
+### Reproducing the GPU-Resident Experiments
+
+Compile:
+
+```bash
+nvcc -O2 -std=c++17 -arch=sm_50 \
+src/hft_analytics.cu -o hft_analytics_research
+```
+
+Run an individual workload:
+
+```bash
+./hft_analytics_research --resident 100000
+```
+
+Run statistical analysis using the five saved raw datasets:
+
+```bash
+python scripts/analyze_resident_results.py
+```
+
+Generate figures:
+
+```bash
+python scripts/plot_resident_results.py
+```
+
+### Experimental Limitations
+
+- Market data is synthetically generated.
+- The experiment evaluates repeated processing of the same input dataset.
+- GPU-resident execution reuses data across 20 analytics passes.
+- Results do not represent live market-feed processing or production HFT latency.
+- GPU setup time is reported separately from steady-state batch latency.
+- Results are specific to the tested hardware and software configuration.
+
 ## Verification
 
 The implementation compares CPU and GPU analytics results.
@@ -276,10 +421,11 @@ This indicates that the implemented verification checks passed for the tested wo
 - [x] Initial CPU vs GPU benchmarking
 
 ### Phase 2 — Benchmarking and Optimisation
-- [ ] Repeated benchmark measurements
-- [ ] Average, minimum and maximum execution time
-- [ ] Throughput measurement (million events/second)
-- [ ] CPU-to-GPU transfer time analysis
+- [x] Repeated benchmark measurements
+- [x] Mean, median, minimum and maximum execution time
+- [x] Throughput measurement
+- [x] CPU-to-GPU transfer time analysis
+- [x] GPU-resident batch processing (single H2D transfer, repeated GPU execution, single D2H transfer)
 - [ ] CUDA block-size experimentation
 - [ ] Memory access optimisation
 - [ ] Pinned host memory experiments
@@ -292,12 +438,13 @@ This indicates that the implemented verification checks passed for the tested wo
 - [ ] Spread dynamics
 
 ### Phase 4 — Performance Visualisation
-- [ ] CPU vs GPU execution-time graphs
-- [ ] Throughput comparison
-- [ ] Kernel speedup visualisation
-- [ ] Memory-transfer overhead analysis
-- [ ] Benchmark result exports
-
+- [x] CPU vs GPU execution-time graphs
+- [x] Throughput comparison
+- [x] Kernel speedup visualisation
+- [x] Memory-transfer overhead analysis
+- [x] Benchmark result exports
+- [x] GPU-resident benchmark visualisation
+- [x] Statistical analysis with 95% confidence intervals
 ## Project Scope
 
 This is an educational and experimental CUDA market analytics project.
