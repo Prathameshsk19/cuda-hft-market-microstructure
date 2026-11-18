@@ -19,3 +19,15 @@ venv/
 
 # System
 .DS_Store
+
+# Python research environment
+.venv/
+__pycache__/
+*.pyc
+
+# Compiled CUDA executables
+hft_analytics
+hft_analytics_research
+
+# Temporary files
+*.tmp
