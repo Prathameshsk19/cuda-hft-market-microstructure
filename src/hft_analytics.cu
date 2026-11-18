@@ -6,6 +6,10 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cuda_runtime.h>
+#include <algorithm>
+#include <fstream>
+#include <iomanip>
+#include <string>
 
 #define CUDA_CHECK(call) do { cudaError_t err = (call); if (err != cudaSuccess) { std::cerr << "CUDA Error: " << cudaGetErrorString(err) << std::endl; std::exit(EXIT_FAILURE); } } while (0)
 
@@ -264,240 +268,603 @@ __global__ void finalVWAP(
 }
 
 // --------------------------------------------------
-// 5. GPU execution and benchmarking
+// 5. Automated benchmarking utilities
 // --------------------------------------------------
 
-int main(int argc, char* argv[])
+constexpr int WARMUP_ITERATIONS = 3;
+constexpr int BENCHMARK_ITERATIONS = 20;
+
+struct DeviceBuffers {
+    float *bid = nullptr, *ask = nullptr, *price = nullptr;
+    uint32_t *bidQty = nullptr, *askQty = nullptr, *volume = nullptr;
+
+    float *spread = nullptr, *mid = nullptr, *obi = nullptr;
+    int *signal = nullptr;
+
+    float *partialN = nullptr, *partialV = nullptr;
+    float *totalN = nullptr, *totalV = nullptr;
+};
+
+struct Timing {
+    double h2d = 0.0;
+    double kernel = 0.0;
+    double d2h = 0.0;
+    double e2e = 0.0;
+};
+
+struct Statistics {
+    double mean;
+    double median;
+    double minimum;
+    double maximum;
+};
+
+Statistics calculateStatistics(const std::vector<double>& values)
 {
-    // Default: 1,048,576 events
-    const int N = (argc > 1)
-        ? std::atoi(argv[1])
-        : (1 << 20);
+    Statistics s{};
 
-    // Validate event count
-    if (N <= 0 || N > 10000000)
-    {
-        std::cerr << "Error: Event count must be between "
-                  << "1 and 10,000,000.\n";
-        return 1;
-    }
+    if (values.empty())
+        return s;
 
-    std::cout << "\nHFT CUDA Market Analytics\n";
-    std::cout << "Events: " << N << "\n\n";
+    std::vector<double> sorted = values;
+    std::sort(sorted.begin(), sorted.end());
 
-    MarketData data = generateMarketData(N);
+    double sum = 0.0;
 
-    // CPU benchmark
-    auto cpuStart = std::chrono::high_resolution_clock::now();
+    for (double value : values)
+        sum += value;
 
-    Results cpuResults = runCPU(data, N);
+    s.mean = sum / values.size();
+    s.minimum = sorted.front();
+    s.maximum = sorted.back();
 
-    auto cpuEnd = std::chrono::high_resolution_clock::now();
+    size_t n = sorted.size();
 
-    double cpuTime =
+    if (n % 2 == 0)
+        s.median = (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0;
+    else
+        s.median = sorted[n / 2];
+
+    return s;
+}
+
+void allocateDeviceMemory(DeviceBuffers& d, int N, int blocks)
+{
+    CUDA_CHECK(cudaMalloc((void**)&d.bid, N * sizeof(float)));
+    CUDA_CHECK(cudaMalloc((void**)&d.ask, N * sizeof(float)));
+    CUDA_CHECK(cudaMalloc((void**)&d.price, N * sizeof(float)));
+
+    CUDA_CHECK(cudaMalloc((void**)&d.bidQty, N * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc((void**)&d.askQty, N * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc((void**)&d.volume, N * sizeof(uint32_t)));
+
+    CUDA_CHECK(cudaMalloc((void**)&d.spread, N * sizeof(float)));
+    CUDA_CHECK(cudaMalloc((void**)&d.mid, N * sizeof(float)));
+    CUDA_CHECK(cudaMalloc((void**)&d.obi, N * sizeof(float)));
+    CUDA_CHECK(cudaMalloc((void**)&d.signal, N * sizeof(int)));
+
+    CUDA_CHECK(cudaMalloc((void**)&d.partialN, blocks * sizeof(float)));
+    CUDA_CHECK(cudaMalloc((void**)&d.partialV, blocks * sizeof(float)));
+
+    CUDA_CHECK(cudaMalloc((void**)&d.totalN, sizeof(float)));
+    CUDA_CHECK(cudaMalloc((void**)&d.totalV, sizeof(float)));
+}
+
+void freeDeviceMemory(DeviceBuffers& d)
+{
+    cudaFree(d.bid);
+    cudaFree(d.ask);
+    cudaFree(d.price);
+
+    cudaFree(d.bidQty);
+    cudaFree(d.askQty);
+    cudaFree(d.volume);
+
+    cudaFree(d.spread);
+    cudaFree(d.mid);
+    cudaFree(d.obi);
+    cudaFree(d.signal);
+
+    cudaFree(d.partialN);
+    cudaFree(d.partialV);
+
+    cudaFree(d.totalN);
+    cudaFree(d.totalV);
+}
+
+// One complete GPU iteration.
+// Allocation is deliberately excluded from this function.
+Timing runGPUIteration(
+    const MarketData& data,
+    Results& results,
+    DeviceBuffers& d,
+    int N,
+    int blocks,
+    cudaEvent_t start,
+    cudaEvent_t stop)
+{
+    Timing timing;
+
+    auto e2eStart = std::chrono::steady_clock::now();
+
+    // -------------------------------
+    // Host-to-device transfer
+    // -------------------------------
+
+    auto h2dStart = std::chrono::steady_clock::now();
+
+    CUDA_CHECK(cudaMemcpy(d.bid, data.bid.data(),
+        N * sizeof(float), cudaMemcpyHostToDevice));
+
+    CUDA_CHECK(cudaMemcpy(d.ask, data.ask.data(),
+        N * sizeof(float), cudaMemcpyHostToDevice));
+
+    CUDA_CHECK(cudaMemcpy(d.bidQty, data.bidQty.data(),
+        N * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+    CUDA_CHECK(cudaMemcpy(d.askQty, data.askQty.data(),
+        N * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+    CUDA_CHECK(cudaMemcpy(d.price, data.tradePrice.data(),
+        N * sizeof(float), cudaMemcpyHostToDevice));
+
+    CUDA_CHECK(cudaMemcpy(d.volume, data.tradeQty.data(),
+        N * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+    auto h2dEnd = std::chrono::steady_clock::now();
+
+    timing.h2d =
         std::chrono::duration<double, std::milli>(
-            cpuEnd - cpuStart).count();
+            h2dEnd - h2dStart).count();
 
-    // Allocate GPU memory
-    float *d_bid, *d_ask;
-    float *d_price;
-    float *d_spread, *d_mid, *d_obi;
-    float *d_partialN, *d_partialV;
-    float *d_totalN, *d_totalV;
-
-    uint32_t *d_bidQty, *d_askQty, *d_volume;
-    int *d_signal;
-
-    CUDA_CHECK(cudaMalloc((void**)&d_bid, N * sizeof(float)));
-    CUDA_CHECK(cudaMalloc((void**)&d_ask, N * sizeof(float)));
-    CUDA_CHECK(cudaMalloc((void**)&d_price, N * sizeof(float)));
-
-    CUDA_CHECK(cudaMalloc((void**)&d_bidQty, N * sizeof(uint32_t)));
-    CUDA_CHECK(cudaMalloc((void**)&d_askQty, N * sizeof(uint32_t)));
-    CUDA_CHECK(cudaMalloc((void**)&d_volume, N * sizeof(uint32_t)));
-
-    CUDA_CHECK(cudaMalloc((void**)&d_spread, N * sizeof(float)));
-    CUDA_CHECK(cudaMalloc((void**)&d_mid, N * sizeof(float)));
-    CUDA_CHECK(cudaMalloc((void**)&d_obi, N * sizeof(float)));
-    CUDA_CHECK(cudaMalloc((void**)&d_signal, N * sizeof(int)));
-
-    int blocks = (N + THREADS - 1) / THREADS;
-
-    CUDA_CHECK(cudaMalloc((void**)&d_partialN, blocks * sizeof(float)));
-    CUDA_CHECK(cudaMalloc((void**)&d_partialV, blocks * sizeof(float)));
-
-    CUDA_CHECK(cudaMalloc((void**)&d_totalN, sizeof(float)));
-    CUDA_CHECK(cudaMalloc((void**)&d_totalV, sizeof(float)));
-
-    Results gpuResults;
-
-    gpuResults.spread.resize(N);
-    gpuResults.mid.resize(N);
-    gpuResults.obi.resize(N);
-    gpuResults.signal.resize(N);
-
-    float totalN, totalV;
-
-    // GPU timing events
-    cudaEvent_t start, stop;
-
-    CUDA_CHECK(cudaEventCreate(&start));
-    CUDA_CHECK(cudaEventCreate(&stop));
-
-    auto gpuStart = std::chrono::high_resolution_clock::now();
-
-    // Transfer market data to GPU
-    CUDA_CHECK(cudaMemcpy(d_bid, data.bid.data(),
-        N * sizeof(float), cudaMemcpyHostToDevice));
-
-    CUDA_CHECK(cudaMemcpy(d_ask, data.ask.data(),
-        N * sizeof(float), cudaMemcpyHostToDevice));
-
-    CUDA_CHECK(cudaMemcpy(d_bidQty, data.bidQty.data(),
-        N * sizeof(uint32_t), cudaMemcpyHostToDevice));
-
-    CUDA_CHECK(cudaMemcpy(d_askQty, data.askQty.data(),
-        N * sizeof(uint32_t), cudaMemcpyHostToDevice));
-
-    CUDA_CHECK(cudaMemcpy(d_price, data.tradePrice.data(),
-        N * sizeof(float), cudaMemcpyHostToDevice));
-
-    CUDA_CHECK(cudaMemcpy(d_volume, data.tradeQty.data(),
-        N * sizeof(uint32_t), cudaMemcpyHostToDevice));
+    // -------------------------------
+    // GPU kernel execution
+    // -------------------------------
 
     CUDA_CHECK(cudaEventRecord(start));
 
-    // Launch analytics kernels
     marketAnalytics<<<blocks, THREADS>>>(
-        d_bid, d_ask,
-        d_bidQty, d_askQty,
-        d_spread, d_mid, d_obi, d_signal, N);
+        d.bid, d.ask,
+        d.bidQty, d.askQty,
+        d.spread, d.mid, d.obi, d.signal,
+        N
+    );
 
     partialVWAP<<<blocks, THREADS>>>(
-        d_price, d_volume,
-        d_partialN, d_partialV, N);
+        d.price, d.volume,
+        d.partialN, d.partialV,
+        N
+    );
 
     finalVWAP<<<1, THREADS>>>(
-        d_partialN, d_partialV,
-        d_totalN, d_totalV, blocks);
+        d.partialN, d.partialV,
+        d.totalN, d.totalV,
+        blocks
+    );
 
     CUDA_CHECK(cudaGetLastError());
 
     CUDA_CHECK(cudaEventRecord(stop));
     CUDA_CHECK(cudaEventSynchronize(stop));
 
-    float kernelTime = 0.0f;
+    float kernelMs = 0.0f;
 
     CUDA_CHECK(cudaEventElapsedTime(
-        &kernelTime, start, stop));
+        &kernelMs, start, stop));
 
-    // Copy results back to CPU
-    CUDA_CHECK(cudaMemcpy(gpuResults.spread.data(), d_spread,
+    timing.kernel = kernelMs;
+
+    // -------------------------------
+    // Device-to-host transfer
+    // -------------------------------
+
+    auto d2hStart = std::chrono::steady_clock::now();
+
+    CUDA_CHECK(cudaMemcpy(results.spread.data(), d.spread,
         N * sizeof(float), cudaMemcpyDeviceToHost));
 
-    CUDA_CHECK(cudaMemcpy(gpuResults.mid.data(), d_mid,
+    CUDA_CHECK(cudaMemcpy(results.mid.data(), d.mid,
         N * sizeof(float), cudaMemcpyDeviceToHost));
 
-    CUDA_CHECK(cudaMemcpy(gpuResults.obi.data(), d_obi,
+    CUDA_CHECK(cudaMemcpy(results.obi.data(), d.obi,
         N * sizeof(float), cudaMemcpyDeviceToHost));
 
-    CUDA_CHECK(cudaMemcpy(gpuResults.signal.data(), d_signal,
+    CUDA_CHECK(cudaMemcpy(results.signal.data(), d.signal,
         N * sizeof(int), cudaMemcpyDeviceToHost));
 
-    CUDA_CHECK(cudaMemcpy(&totalN, d_totalN,
+    float totalN = 0.0f;
+    float totalV = 0.0f;
+
+    CUDA_CHECK(cudaMemcpy(&totalN, d.totalN,
         sizeof(float), cudaMemcpyDeviceToHost));
 
-    CUDA_CHECK(cudaMemcpy(&totalV, d_totalV,
+    CUDA_CHECK(cudaMemcpy(&totalV, d.totalV,
         sizeof(float), cudaMemcpyDeviceToHost));
 
-    gpuResults.vwap = totalN / totalV;
+    results.vwap = totalN / totalV;
 
-    auto gpuEnd = std::chrono::high_resolution_clock::now();
+    auto d2hEnd = std::chrono::steady_clock::now();
 
-    double gpuTotalTime =
+    timing.d2h =
         std::chrono::duration<double, std::milli>(
-            gpuEnd - gpuStart).count();
+            d2hEnd - d2hStart).count();
 
-    // --------------------------------------------------
-    // 6. Results and verification
-    // --------------------------------------------------
+    auto e2eEnd = std::chrono::steady_clock::now();
+
+    timing.e2e =
+        std::chrono::duration<double, std::milli>(
+            e2eEnd - e2eStart).count();
+
+    return timing;
+}
+
+bool verifyResults(
+    const Results& cpu,
+    const Results& gpu,
+    int N)
+{
+    constexpr float ARRAY_TOLERANCE = 1e-5f;
+    constexpr float VWAP_TOLERANCE = 0.01f;
+
+    for (int i = 0; i < N; i++)
+    {
+        if (std::fabs(cpu.spread[i] - gpu.spread[i])
+                > ARRAY_TOLERANCE ||
+            std::fabs(cpu.mid[i] - gpu.mid[i])
+                > ARRAY_TOLERANCE ||
+            std::fabs(cpu.obi[i] - gpu.obi[i])
+                > ARRAY_TOLERANCE ||
+            cpu.signal[i] != gpu.signal[i])
+        {
+            std::cerr << "Verification failed at event "
+                      << i << "\n";
+            return false;
+        }
+    }
+
+    if (std::fabs(cpu.vwap - gpu.vwap) > VWAP_TOLERANCE)
+    {
+        std::cerr << "VWAP verification failed. CPU: "
+                  << cpu.vwap << ", GPU: " << gpu.vwap << "\n";
+        return false;
+    }
+
+    return true;
+}
+
+// --------------------------------------------------
+// 6. Benchmark one workload
+// --------------------------------------------------
+
+bool benchmarkWorkload(int N, std::ofstream& csv)
+{
+    std::cout << "\n========================================\n";
+    std::cout << "Benchmarking " << N << " events\n";
+    std::cout << "========================================\n";
+
+    MarketData data = generateMarketData(N);
+
+    Results cpuResults;
+    Results gpuResults;
+
+    // -------------------------------
+    // GPU setup and allocation
+    // -------------------------------
+
+    int blocks = (N + THREADS - 1) / THREADS;
+
+    DeviceBuffers d;
+
+    gpuResults.spread.resize(N);
+    gpuResults.mid.resize(N);
+    gpuResults.obi.resize(N);
+    gpuResults.signal.resize(N);
+
+    cudaEvent_t start, stop;
+
+    auto setupStart = std::chrono::steady_clock::now();
+
+    allocateDeviceMemory(d, N, blocks);
+
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+
+    auto setupEnd = std::chrono::steady_clock::now();
+
+    double setupMs =
+        std::chrono::duration<double, std::milli>(
+            setupEnd - setupStart).count();
+
+    // -------------------------------
+    // Warm-up iterations
+    // -------------------------------
+
+    std::cout << "Running " << WARMUP_ITERATIONS
+              << " warm-up iterations...\n";
+
+    for (int i = 0; i < WARMUP_ITERATIONS; i++)
+    {
+        Results warmupCPU = runCPU(data, N);
+
+        runGPUIteration(
+            data, gpuResults, d, N, blocks, start, stop
+        );
+    }
+
+    // -------------------------------
+    // Measured CPU iterations
+    // -------------------------------
+
+    std::vector<double> cpuTimes;
+
+    std::cout << "Running " << BENCHMARK_ITERATIONS
+              << " CPU iterations...\n";
+
+    for (int i = 0; i < BENCHMARK_ITERATIONS; i++)
+    {
+        auto cpuStart = std::chrono::steady_clock::now();
+
+        cpuResults = runCPU(data, N);
+
+        auto cpuEnd = std::chrono::steady_clock::now();
+
+        double elapsed =
+            std::chrono::duration<double, std::milli>(
+                cpuEnd - cpuStart).count();
+
+        cpuTimes.push_back(elapsed);
+    }
+
+    // -------------------------------
+    // Measured GPU iterations
+    // -------------------------------
+
+    std::vector<double> h2dTimes;
+    std::vector<double> kernelTimes;
+    std::vector<double> d2hTimes;
+    std::vector<double> e2eTimes;
+
+    std::cout << "Running " << BENCHMARK_ITERATIONS
+              << " GPU iterations...\n";
+
+    for (int i = 0; i < BENCHMARK_ITERATIONS; i++)
+    {
+        Timing t = runGPUIteration(
+            data, gpuResults, d, N, blocks, start, stop
+        );
+
+        h2dTimes.push_back(t.h2d);
+        kernelTimes.push_back(t.kernel);
+        d2hTimes.push_back(t.d2h);
+        e2eTimes.push_back(t.e2e);
+    }
+
+    // -------------------------------
+    // Statistics
+    // -------------------------------
+
+    Statistics cpu = calculateStatistics(cpuTimes);
+    Statistics h2d = calculateStatistics(h2dTimes);
+    Statistics kernel = calculateStatistics(kernelTimes);
+    Statistics d2h = calculateStatistics(d2hTimes);
+    Statistics e2e = calculateStatistics(e2eTimes);
+
+    // -------------------------------
+    // Correctness verification
+    // -------------------------------
+
+    bool correct = verifyResults(cpuResults, gpuResults, N);
+
+    // -------------------------------
+    // Throughput and speedup
+    // -------------------------------
+
+    double cpuThroughput = N / (cpu.mean * 1000.0);
+    double kernelThroughput = N / (kernel.mean * 1000.0);
+    double e2eThroughput = N / (e2e.mean * 1000.0);
+
+    double kernelSpeedup = cpu.mean / kernel.mean;
+    double e2eSpeedup = cpu.mean / e2e.mean;
+
+    // -------------------------------
+    // Market analytics summary
+    // -------------------------------
 
     double avgSpread = 0.0;
     double avgOBI = 0.0;
 
-    int buy = 0, sell = 0, neutral = 0;
-
-    bool correct = true;
+    int buy = 0;
+    int sell = 0;
+    int neutral = 0;
 
     for (int i = 0; i < N; i++)
     {
         avgSpread += gpuResults.spread[i];
         avgOBI += gpuResults.obi[i];
 
-        if (gpuResults.signal[i] == BUY_PRESSURE) buy++;
-        else if (gpuResults.signal[i] == SELL_PRESSURE) sell++;
-        else neutral++;
-
-        if (std::fabs(gpuResults.spread[i] -
-                      cpuResults.spread[i]) > 1e-5f ||
-            std::fabs(gpuResults.obi[i] -
-                      cpuResults.obi[i]) > 1e-5f ||
-            gpuResults.signal[i] != cpuResults.signal[i])
-        {
-            correct = false;
-            break;
-        }
+        if (gpuResults.signal[i] == BUY_PRESSURE)
+            buy++;
+        else if (gpuResults.signal[i] == SELL_PRESSURE)
+            sell++;
+        else
+            neutral++;
     }
 
     avgSpread /= N;
     avgOBI /= N;
 
-    std::cout << "\n========== MARKET ANALYTICS ==========\n";
+    // -------------------------------
+    // Print results
+    // -------------------------------
 
-    std::cout << "Average Spread: " << avgSpread << "\n";
-    std::cout << "Average OBI: " << avgOBI << "\n";
-    std::cout << "VWAP (GPU): " << gpuResults.vwap << "\n";
-    std::cout << "VWAP (CPU): " << cpuResults.vwap << "\n";
+    std::cout << std::fixed << std::setprecision(4);
 
-    std::cout << "\nMarket Signals:\n";
-    std::cout << "Buy Pressure: " << buy << "\n";
-    std::cout << "Sell Pressure: " << sell << "\n";
-    std::cout << "Neutral: " << neutral << "\n";
+    std::cout << "\n--- Timing statistics (ms) ---\n";
 
-    std::cout << "\n========== BENCHMARK ==========\n";
+    std::cout << "CPU mean:       " << cpu.mean << "\n";
+    std::cout << "CPU median:     " << cpu.median << "\n";
+    std::cout << "CPU min/max:    " << cpu.minimum
+              << " / " << cpu.maximum << "\n";
 
-    std::cout << "CPU Time: " << cpuTime << " ms\n";
-    std::cout << "GPU Kernel Time: " << kernelTime << " ms\n";
-    std::cout << "GPU End-to-End Time: "
-              << gpuTotalTime << " ms\n";
+    std::cout << "\nH2D mean:       " << h2d.mean << "\n";
+    std::cout << "Kernel mean:    " << kernel.mean << "\n";
+    std::cout << "Kernel median:  " << kernel.median << "\n";
+    std::cout << "Kernel min/max: " << kernel.minimum
+              << " / " << kernel.maximum << "\n";
+    std::cout << "D2H mean:       " << d2h.mean << "\n";
 
-    std::cout << "Kernel-only Speedup: "
-              << cpuTime / kernelTime << "x\n";
+    std::cout << "\nGPU E2E mean:   " << e2e.mean << "\n";
+    std::cout << "GPU E2E median: " << e2e.median << "\n";
+    std::cout << "GPU E2E min/max:" << e2e.minimum
+              << " / " << e2e.maximum << "\n";
 
-    std::cout << "End-to-End Speedup: "
-              << cpuTime / gpuTotalTime << "x\n";
+    std::cout << "GPU setup:      " << setupMs << " ms\n";
+
+    std::cout << "\n--- Performance ---\n";
+    std::cout << "CPU throughput:          "
+              << cpuThroughput << " M events/s\n";
+    std::cout << "GPU kernel throughput:   "
+              << kernelThroughput << " M events/s\n";
+    std::cout << "GPU E2E throughput:      "
+              << e2eThroughput << " M events/s\n";
+
+    std::cout << "Kernel-only speedup:     "
+              << kernelSpeedup << "x\n";
+    std::cout << "End-to-end speedup:      "
+              << e2eSpeedup << "x\n";
+
+    std::cout << "\n--- Market analytics ---\n";
+    std::cout << "Average spread: " << avgSpread << "\n";
+    std::cout << "Average OBI:    " << avgOBI << "\n";
+    std::cout << "VWAP CPU:       " << cpuResults.vwap << "\n";
+    std::cout << "VWAP GPU:       " << gpuResults.vwap << "\n";
+
+    std::cout << "Buy pressure:   " << buy << "\n";
+    std::cout << "Sell pressure:  " << sell << "\n";
+    std::cout << "Neutral:        " << neutral << "\n";
 
     std::cout << "\nVerification: "
               << (correct ? "PASSED" : "FAILED") << "\n";
 
+    // -------------------------------
+    // CSV export
+    // -------------------------------
+
+    csv << N << ","
+        << cpu.mean << "," << cpu.median << ","
+        << cpu.minimum << "," << cpu.maximum << ","
+        << h2d.mean << "," << h2d.median << ","
+        << kernel.mean << "," << kernel.median << ","
+        << kernel.minimum << "," << kernel.maximum << ","
+        << d2h.mean << "," << d2h.median << ","
+        << e2e.mean << "," << e2e.median << ","
+        << e2e.minimum << "," << e2e.maximum << ","
+        << setupMs << ","
+        << cpuThroughput << ","
+        << kernelThroughput << ","
+        << e2eThroughput << ","
+        << kernelSpeedup << ","
+        << e2eSpeedup << ","
+        << (correct ? "PASSED" : "FAILED")
+        << "\n";
+
+    csv.flush();
+
+    // -------------------------------
     // Cleanup
-    cudaFree(d_bid);
-    cudaFree(d_ask);
-    cudaFree(d_price);
-    cudaFree(d_bidQty);
-    cudaFree(d_askQty);
-    cudaFree(d_volume);
-    cudaFree(d_spread);
-    cudaFree(d_mid);
-    cudaFree(d_obi);
-    cudaFree(d_signal);
-    cudaFree(d_partialN);
-    cudaFree(d_partialV);
-    cudaFree(d_totalN);
-    cudaFree(d_totalV);
+    // -------------------------------
 
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
 
-    return correct ? 0 : 1;
+    freeDeviceMemory(d);
+
+    return correct;
 }
+
+// --------------------------------------------------
+// 7. Main
+// --------------------------------------------------
+
+int main(int argc, char* argv[])
+{
+    std::vector<int> workloads = {
+        100000,
+        500000,
+        1000000,
+        2000000,
+        5000000
+    };
+
+    // Optional: run only one workload.
+    if (argc == 2)
+    {
+        int N = std::atoi(argv[1]);
+
+        if (N <= 0 || N > 10000000)
+        {
+            std::cerr << "Event count must be between 1 and "
+                      << "10,000,000.\n";
+            return 1;
+        }
+
+        workloads = {N};
+    }
+    else if (argc > 2)
+    {
+        std::cerr << "Usage: ./hft_analytics [event_count]\n";
+        return 1;
+    }
+
+    std::ofstream csv(
+        "benchmarks/automated_results.csv"
+    );
+
+    if (!csv.is_open())
+    {
+        std::cerr << "Could not open benchmarks/automated_results.csv\n";
+        return 1;
+    }
+
+    csv << std::fixed << std::setprecision(6);
+
+    csv << "events,"
+        << "cpu_mean_ms,cpu_median_ms,cpu_min_ms,cpu_max_ms,"
+        << "h2d_mean_ms,h2d_median_ms,"
+        << "kernel_mean_ms,kernel_median_ms,kernel_min_ms,kernel_max_ms,"
+        << "d2h_mean_ms,d2h_median_ms,"
+        << "gpu_e2e_mean_ms,gpu_e2e_median_ms,"
+        << "gpu_e2e_min_ms,gpu_e2e_max_ms,"
+        << "setup_ms,"
+        << "cpu_throughput_mops,"
+        << "gpu_kernel_throughput_mops,"
+        << "gpu_e2e_throughput_mops,"
+        << "kernel_speedup,e2e_speedup,verification\n";
+
+    bool allPassed = true;
+
+    std::cout << "\nCUDA HFT Automated Benchmark\n";
+    std::cout << "Warm-up iterations: " << WARMUP_ITERATIONS << "\n";
+    std::cout << "Measured iterations: " << BENCHMARK_ITERATIONS << "\n";
+
+    for (int N : workloads)
+    {
+        bool passed = benchmarkWorkload(N, csv);
+
+        if (!passed)
+            allPassed = false;
+    }
+
+    csv.close();
+
+    std::cout << "\n========================================\n";
+    std::cout << "Benchmark suite completed.\n";
+    std::cout << "CSV: benchmarks/automated_results.csv\n";
+    std::cout << "Overall verification: "
+              << (allPassed ? "PASSED" : "FAILED") << "\n";
+    std::cout << "========================================\n";
+
+    return allPassed ? 0 : 1;
+}
+    
+   
