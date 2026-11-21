@@ -1,0 +1,5 @@
+kernel_stream,copy_stream,transfer,kernel_events,copy_events,kernel_execution_ms,overlapping_event_pairs,overlap_ms,overlap_percentage_of_kernel_time
+13,14,H2D,6744,4464,479.455331,264,91.590638,19.10305967585539
+13,14,D2H,6744,4464,479.455331,1968,73.796301,15.39169474788883
+14,13,H2D,2232,13488,167.035401,0,0.0,0.0
+14,13,D2H,2232,13488,167.035401,2232,167.035401,100.0
